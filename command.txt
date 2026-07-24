@@ -1,0 +1,1 @@
+python pr_detector.py --owner armaandeol --repo Test_Repo --poll --interval 30 --comment --lines
