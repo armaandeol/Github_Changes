@@ -42,6 +42,9 @@ from dotenv import load_dotenv
 import git
 from git.exc import GitCommandError, InvalidGitRepositoryError, NoSuchPathError
 
+from google import genai
+from google.genai import types as genai_types
+
 load_dotenv()  # reads .env in the current working directory and populates os.environ
 
 GITHUB_API = "https://api.github.com"
@@ -49,6 +52,27 @@ GITHUB_API = "https://api.github.com"
 # How many days count as "recent" for the arexp (recent author experience) feature.
 # Kept as a module-level constant so it's easy to tune without touching the logic.
 RECENT_EXPERIENCE_DAYS = 90
+
+# Latest stable Gemini model, used for post-FeatureVector deployment-risk analysis.
+GEMINI_MODEL = "gemini-3.6-flash"
+
+SYSTEM_PROMPT = """You are a deployment-risk analyst for software pull requests.
+
+You will be given a PR's metadata, its changed files, its added/removed lines,
+and a 12-feature Just-In-Time (JIT) defect-prediction feature vector (ns, nd,
+nf, ent, la, ld, ndev, age, nuc, aexp, arexp, asexp).
+
+Analyze the deployment risk of this PR and respond with ONLY a single valid
+JSON object matching exactly this schema, with no markdown, no code fences,
+and no text before or after it:
+
+{
+  "risk_score": <integer 0-100>,
+  "risk_level": "<Low|Medium|High|Critical>",
+  "summary": "<2-3 sentence explanation of the risk assessment>",
+  "top_risk_factors": ["<factor 1>", "<factor 2>", "<factor 3>"],
+  "recommendations": ["<recommendation 1>", "<recommendation 2>", "<recommendation 3>"]
+}"""
 
 
 @dataclass
@@ -452,6 +476,99 @@ def parse_patch_lines(patch: Optional[str]):
     return added, removed
 
 
+class GeminiRiskAnalyzer:
+    """
+    Sends a PR's metadata, files, added/removed lines, and FeatureVector to
+    Gemini using a fixed system prompt, and returns the model's structured
+    risk assessment as a Python dict.
+    """
+
+    def __init__(self, api_key: Optional[str] = None, model: str = GEMINI_MODEL):
+        api_key = api_key or os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY not set (add it to your .env file)")
+        self.client = genai.Client(api_key=api_key)
+        self.model = model
+
+    @staticmethod
+    def _build_user_message(details: PRDetails, fv: FeatureVector) -> str:
+        added_lines, removed_lines = [], []
+        for f in details.files:
+            a, r = parse_patch_lines(f.patch)
+            added_lines.extend(a)
+            removed_lines.extend(r)
+
+        files_block = "\n".join(f"- {f.filename} ({f.status})" for f in details.files) or "(none)"
+        added_block = "\n".join(added_lines) or "(none)"
+        removed_block = "\n".join(removed_lines) or "(none)"
+
+        return (
+            "PR\n\n"
+            f"Title:\n{details.title}\n\n"
+            f"Author:\n{details.author}\n\n"
+            f"Files:\n{files_block}\n\n"
+            f"Added lines:\n{added_block}\n\n"
+            f"Removed lines:\n{removed_block}\n\n"
+            "Feature Vector\n\n"
+            f"{json.dumps(fv.to_dict(), indent=2)}"
+        )
+
+    def analyze(self, details: PRDetails, fv: FeatureVector) -> dict:
+        """Sends the PR + FeatureVector to Gemini and returns the parsed JSON response."""
+        user_message = self._build_user_message(details, fv)
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=user_message,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                response_mime_type="application/json",
+            ),
+        )
+        raw_text = response.text
+        try:
+            return json.loads(raw_text)
+        except json.JSONDecodeError:
+            return {"raw_response": raw_text}
+
+
+def save_output(pr_number: int, repository: str, fv: FeatureVector, llm_response: dict) -> str:
+    """Saves the FeatureVector + Gemini risk assessment to outputs/pr_<PR_NUMBER>.json."""
+    os.makedirs("outputs", exist_ok=True)
+    payload = {
+        "pr_number": pr_number,
+        "repository": repository,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "feature_vector": fv.to_dict(),
+        "llm_response": llm_response,
+    }
+    path = os.path.join("outputs", f"pr_{pr_number}.json")
+    with open(path, "w") as fp:
+        json.dump(payload, fp, indent=2)
+    return path
+
+
+def _run_risk_analysis(analyzer: "GeminiRiskAnalyzer", details: PRDetails, fv: FeatureVector, repository: str):
+    """Calls GeminiRiskAnalyzer, saves the result, and prints the summary block. Never raises."""
+    try:
+        risk = analyzer.analyze(details, fv)
+    except Exception:
+        print("LLM analysis failed")
+        return
+    output_path = save_output(details.number, repository, fv, risk)
+    print("-" * 50)
+    print("Deployment Risk")
+    print()
+    print(f"Risk Score : {risk.get('risk_score', 'N/A')}")
+    print(f"Risk Level : {str(risk.get('risk_level', 'N/A')).upper()}")
+    print()
+    print("Summary :")
+    print(risk.get("summary", ""))
+    print()
+    print("Saved to")
+    print(output_path)
+    print("-" * 50)
+
+
 def print_line_changes(details: PRDetails):
     """Prints a clean, per-file breakdown of exactly which lines were added vs removed."""
     print("=" * 70)
@@ -515,7 +632,8 @@ def print_feature_vector(fv: FeatureVector, pr_number: int):
 
 
 def poll_for_new_prs(client: GitHubPRClient, interval: int, show_patch: bool, post_comment: bool,
-                     show_lines: bool = False, feature_extractor: Optional[GitFeatureExtractor] = None):
+                     show_lines: bool = False, feature_extractor: Optional[GitFeatureExtractor] = None,
+                     analyzer: Optional["GeminiRiskAnalyzer"] = None):
     """
     Repeatedly checks for open PRs. Tracks the 'updated_at' timestamp of the
     most recently seen PR per number so it only reports genuinely new activity
@@ -544,6 +662,8 @@ def poll_for_new_prs(client: GitHubPRClient, interval: int, show_patch: bool, po
                             print(f"  -> Warning: fetch before feature extraction failed: {e}", file=sys.stderr)
                         fv = feature_extractor.extract(details)
                         print_feature_vector(fv, number)
+                        if analyzer is not None:
+                            _run_risk_analysis(analyzer, details, fv, f"{client.owner}/{client.repo}")
                     if post_comment:
                         try:
                             client.post_pr_comment(number, "Reviewed by DeployIQ")
@@ -583,14 +703,19 @@ def main():
     client = GitHubPRClient(args.owner, args.repo, token=args.token)
 
     feature_extractor = None
+    analyzer = None
     if args.features:
         repo_manager = LocalRepoManager(args.owner, args.repo, local_path=args.repo_path, token=args.token)
         local_repo = repo_manager.get_repo()
         feature_extractor = GitFeatureExtractor(local_repo, recent_experience_days=args.recent_days)
+        try:
+            analyzer = GeminiRiskAnalyzer()
+        except RuntimeError as e:
+            print(f"Warning: Gemini risk analysis disabled ({e})", file=sys.stderr)
 
     if args.poll:
         poll_for_new_prs(client, interval=args.interval, show_patch=args.patch, post_comment=args.comment,
-                         show_lines=args.lines, feature_extractor=feature_extractor)
+                         show_lines=args.lines, feature_extractor=feature_extractor, analyzer=analyzer)
     elif args.pr:
         details = client.get_pr_details(args.pr)
         if args.json:
@@ -605,6 +730,8 @@ def main():
                 print(json.dumps(fv.to_dict(), indent=2))
             else:
                 print_feature_vector(fv, args.pr)
+            if analyzer is not None:
+                _run_risk_analysis(analyzer, details, fv, f"{args.owner}/{args.repo}")
         if args.comment:
             client.post_pr_comment(args.pr, "Reviewed by DeployIQ")
             print(f"Posted comment on PR #{args.pr}")
@@ -622,6 +749,8 @@ def main():
             if feature_extractor is not None:
                 fv = feature_extractor.extract(details)
                 print_feature_vector(fv, summary["number"])
+                if analyzer is not None:
+                    _run_risk_analysis(analyzer, details, fv, f"{args.owner}/{args.repo}")
             if args.comment:
                 client.post_pr_comment(summary["number"], "Reviewed by DeployIQ")
                 print(f"Posted comment on PR #{summary['number']}")
