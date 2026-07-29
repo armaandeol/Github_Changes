@@ -1,0 +1,27 @@
+{
+  "auc_roc": 0.8005508583869407,
+  "auc_pr": 0.5674861523544549,
+  "auc_pr_baseline": 0.24355875546412958,
+  "brier": 0.14684930443763733,
+  "brier_constant": 0.18423791229724884,
+  "n_test": 19445,
+  "test_base_rate": 0.24355875546412958,
+  "top_decile_lift": 2.7948894427846875,
+  "top_decile_recall": 0.2795608108108108,
+  "model_version": "v1",
+  "split_strategy": "mature",
+  "include_fix": false,
+  "n_train": 66144,
+  "n_val": 10688,
+  "train_base_rate": 0.29299709724238027,
+  "val_base_rate": 0.28882859281437123,
+  "shap_additivity_max_error": 1.6689300537109375e-06,
+  "targets": {
+    "auc_roc": 0.72,
+    "brier": 0.18
+  },
+  "passes_auc_target": true,
+  "passes_brier_target": true,
+  "beats_constant_baseline": true,
+  "created_at": "2026-07-29T13:37:38.717401+00:00"
+}

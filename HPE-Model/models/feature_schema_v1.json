@@ -1,0 +1,153 @@
+{
+  "model_version": "v1",
+  "feature_order": [
+    "ns",
+    "nd",
+    "nf",
+    "ent",
+    "la",
+    "ld",
+    "ndev",
+    "age",
+    "nuc",
+    "aexp",
+    "arexp",
+    "asexp"
+  ],
+  "n_features": 12,
+  "feature_metadata": {
+    "ns": {
+      "display_name": "Subsystems Changed",
+      "description": "Distinct top-level directories touched",
+      "higher_is_riskier": true,
+      "missing_strategy": "zero"
+    },
+    "nd": {
+      "display_name": "Directories Changed",
+      "description": "Distinct directories touched",
+      "higher_is_riskier": true,
+      "missing_strategy": "zero"
+    },
+    "nf": {
+      "display_name": "Files Changed",
+      "description": "Number of files in the change",
+      "higher_is_riskier": true,
+      "missing_strategy": "zero"
+    },
+    "ent": {
+      "display_name": "Change Entropy",
+      "description": "RAW Shannon entropy (base 2) of the line-change distribution across files. Bounded by log2(nf), NOT normalised to [0,1].",
+      "higher_is_riskier": true,
+      "missing_strategy": "zero"
+    },
+    "la": {
+      "display_name": "Lines Added",
+      "description": "Total inserted lines",
+      "higher_is_riskier": true,
+      "missing_strategy": "zero"
+    },
+    "ld": {
+      "display_name": "Lines Deleted",
+      "description": "Total deleted lines",
+      "higher_is_riskier": true,
+      "missing_strategy": "zero"
+    },
+    "ndev": {
+      "display_name": "Prior Authors",
+      "description": "Mean distinct developers who previously touched these files",
+      "higher_is_riskier": true,
+      "missing_strategy": "nan"
+    },
+    "age": {
+      "display_name": "File Age (days)",
+      "description": "Mean interval since the previous change to touched files",
+      "higher_is_riskier": false,
+      "missing_strategy": "nan"
+    },
+    "nuc": {
+      "display_name": "Prior Changes",
+      "description": "Number of prior changes to touched files",
+      "higher_is_riskier": true,
+      "missing_strategy": "nan"
+    },
+    "aexp": {
+      "display_name": "Author Experience",
+      "description": "Author's prior commit count in repo",
+      "higher_is_riskier": false,
+      "missing_strategy": "zero"
+    },
+    "arexp": {
+      "display_name": "Recent Experience",
+      "description": "Recency-weighted prior commit count",
+      "higher_is_riskier": false,
+      "missing_strategy": "zero"
+    },
+    "asexp": {
+      "display_name": "Subsystem Experience",
+      "description": "Author's prior commits in the touched subsystems",
+      "higher_is_riskier": false,
+      "missing_strategy": "zero"
+    }
+  },
+  "entropy_spec": {
+    "definition": "raw_shannon_base2",
+    "normalised": false,
+    "bounds": "[0, log2(nf)]",
+    "reference_impl": "total = sum(f.changes for f in files)\nif total == 0 or len(files) <= 1:\n    ent = 0.0\nelse:\n    probs = [f.changes / total for f in files if f.changes > 0]\n    ent = -sum(p * math.log2(p) for p in probs)   # NO /log2(n) normalisation",
+    "warning": "PRD Module 3 specifies a normalised variant. Do not use it with this model."
+  },
+  "excluded_features": {
+    "lt": "Not present in ApacheJIT. Remove from Module 3 extractor output.",
+    "fix": "Excluded \u2014 SZZ label artifact. Compute and display as context, never feed to the model."
+  },
+  "naming_map": {
+    "exp": "aexp",
+    "rexp": "arexp",
+    "sexp": "asexp"
+  },
+  "transform": "identity (tree splits are invariant under monotone transforms; log1p is a no-op here)",
+  "training": {
+    "dataset": "ApacheJIT (Keshavarz & Nagappan, MSR 2022)",
+    "split_strategy": "mature",
+    "seed": 42,
+    "scale_pos_weight": 2.413003095975232,
+    "hyperparameters": {
+      "max_depth": 9,
+      "learning_rate": 0.015960757342242584,
+      "n_estimators": 307,
+      "subsample": 0.8755018207309047,
+      "colsample_bytree": 0.6900744978144124,
+      "min_child_weight": 10,
+      "gamma": 0.6363491268055592,
+      "reg_alpha": 1.0320073777764865e-08,
+      "reg_lambda": 1.4101369077180506e-06
+    },
+    "best_iteration": 138,
+    "n_trees_saved": 139,
+    "calibration": "isotonic, fitted on validation split",
+    "probability_clip": [
+      0.001,
+      0.999
+    ],
+    "inference_note": "Artifact is already truncated to best_iteration. Load with xgb.Booster().load_model() and call predict() with no iteration_range \u2014 all saved trees are intended."
+  },
+  "risk_thresholds": {
+    "LOW": [
+      0.0,
+      0.3
+    ],
+    "MEDIUM": [
+      0.3,
+      0.6
+    ],
+    "HIGH": [
+      0.6,
+      0.85
+    ],
+    "CRITICAL": [
+      0.85,
+      1.01
+    ]
+  },
+  "created_at": "2026-07-29T13:37:38.716803+00:00"
+}
