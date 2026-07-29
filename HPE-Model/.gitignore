@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Logs and databases
+*.log
+uvicorn.log
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+
+# macOS system files
+.DS_Store
+
+# IDE / Editor settings
+.vscode/
+.idea/
+
+# Large Model Files / Pickles (Optional, but recommended if >100MB)
+# models/*.pkl

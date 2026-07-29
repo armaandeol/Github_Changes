@@ -45,6 +45,17 @@ from git.exc import GitCommandError, InvalidGitRepositoryError, NoSuchPathError
 from google import genai
 from google.genai import types as genai_types
 
+try:
+    import joblib
+    import numpy as np
+    import shap
+    import xgboost as xgb
+except ImportError:  # pragma: no cover - exercised only when optional deps are absent
+    joblib = None
+    np = None
+    shap = None
+    xgb = None
+
 load_dotenv()  # reads .env in the current working directory and populates os.environ
 
 GITHUB_API = "https://api.github.com"
@@ -476,6 +487,77 @@ def parse_patch_lines(patch: Optional[str]):
     return added, removed
 
 
+class MLModelRiskAnalyzer:
+    """
+    Loads the trained XGBoost-based ApacheJIT model from the HPE-Model assets
+    and scores the same 12-feature vector used for the LLM analysis.
+    """
+
+    def __init__(self, model_path: Optional[str] = None, calibrator_path: Optional[str] = None,
+                 schema_path: Optional[str] = None):
+        if joblib is None or np is None or shap is None or xgb is None:
+            raise RuntimeError("ML dependencies missing. Install xgboost, joblib, numpy, shap, and scikit-learn")
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.model_path = model_path or os.path.join(base_dir, "HPE-Model", "models", "xgboost_jit_v1.json")
+        self.calibrator_path = calibrator_path or os.path.join(base_dir, "HPE-Model", "models", "calibrator_v1.pkl")
+        self.schema_path = schema_path or os.path.join(base_dir, "HPE-Model", "models", "feature_schema_v1.json")
+
+        self.model = xgb.Booster()
+        self.model.load_model(self.model_path)
+        self.calibrator = joblib.load(self.calibrator_path)
+        self.explainer = shap.TreeExplainer(self.model)
+
+        with open(self.schema_path, "r") as fp:
+            self.schema = json.load(fp)
+        self.feature_order = self.schema.get("feature_order", [])
+        self.risk_thresholds = self.schema.get("risk_thresholds", {})
+
+    def _risk_band(self, probability: float) -> str:
+        for band, (low, high) in self.risk_thresholds.items():
+            if low <= probability < high:
+                return band
+        return "LOW"
+
+    def predict(self, fv: FeatureVector) -> dict:
+        """Runs the trained ML model against the extracted feature vector."""
+        feature_values = {name: getattr(fv, name) for name in self.feature_order}
+        input_array = np.array([[feature_values[name] for name in self.feature_order]], dtype=float)
+        dmatrix = xgb.DMatrix(input_array, feature_names=self.feature_order)
+
+        raw_prob = float(self.model.predict(dmatrix)[0])
+        calibrated_prob = float(self.calibrator.transform([raw_prob])[0])
+
+        shap_values = self.explainer.shap_values(input_array)
+        if isinstance(shap_values, list):
+            shap_values = shap_values[0]
+        shap_array = np.asarray(shap_values)[0]
+        base_value = float(np.asarray(self.explainer.expected_value).reshape(-1)[0])
+
+        contributions = []
+        for idx, feature_name in enumerate(self.feature_order):
+            contribution = {
+                "feature_name": feature_name,
+                "feature_value": float(input_array[0][idx]),
+                "shap_value": float(shap_array[idx]),
+                "direction": "increases_risk" if shap_array[idx] > 0 else "decreases_risk",
+            }
+            contributions.append(contribution)
+        contributions.sort(key=lambda item: abs(item["shap_value"]), reverse=True)
+
+        return {
+            "raw_probability": round(raw_prob, 6),
+            "bug_probability": round(calibrated_prob, 6),
+            "risk_level": self._risk_band(calibrated_prob),
+            "feature_vector": fv.to_dict(),
+            "shap_explanation": {
+                "base_value": round(base_value, 6),
+                "output_value": round(calibrated_prob, 6),
+                "top_contributions": contributions,
+            },
+        }
+
+
 class GeminiRiskAnalyzer:
     """
     Sends a PR's metadata, files, added/removed lines, and FeatureVector to
@@ -547,26 +629,77 @@ def save_output(pr_number: int, repository: str, fv: FeatureVector, llm_response
     return path
 
 
-def _run_risk_analysis(analyzer: "GeminiRiskAnalyzer", details: PRDetails, fv: FeatureVector, repository: str):
-    """Calls GeminiRiskAnalyzer, saves the result, and prints the summary block. Never raises."""
-    try:
-        risk = analyzer.analyze(details, fv)
-    except Exception:
-        print("LLM analysis failed")
-        return
-    output_path = save_output(details.number, repository, fv, risk)
-    print("-" * 50)
-    print("Deployment Risk")
-    print()
-    print(f"Risk Score : {risk.get('risk_score', 'N/A')}")
-    print(f"Risk Level : {str(risk.get('risk_level', 'N/A')).upper()}")
-    print()
-    print("Summary :")
-    print(risk.get("summary", ""))
-    print()
-    print("Saved to")
-    print(output_path)
-    print("-" * 50)
+def save_ml_output(pr_number: int, repository: str, fv: FeatureVector, ml_result: dict) -> str:
+    """Saves the ML model prediction to outputs/pr_<PR_NUMBER>.txt."""
+    os.makedirs("outputs", exist_ok=True)
+    shap_explanation = ml_result.get("shap_explanation", {}) or {}
+    contributions = shap_explanation.get("top_contributions", []) or []
+    contribution_block = "\n".join(
+        f"- {item['feature_name']}: value={item['feature_value']}, shap_value={item['shap_value']}, direction={item['direction']}"
+        for item in contributions
+    )
+    if not contribution_block:
+        contribution_block = "(no SHAP contributions available)"
+
+    content = (
+        f"PR #{pr_number}\n"
+        f"Repository: {repository}\n"
+        f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n\n"
+        f"Feature Vector:\n{json.dumps(fv.to_dict(), indent=2)}\n\n"
+        f"ML Prediction:\n"
+        f"raw_probability: {ml_result.get('raw_probability', 'N/A')}\n"
+        f"bug_probability: {ml_result.get('bug_probability', 'N/A')}\n"
+        f"risk_level: {ml_result.get('risk_level', 'N/A')}\n\n"
+        f"SHAP Explanation:\n"
+        f"base_value: {shap_explanation.get('base_value', 'N/A')}\n"
+        f"output_value: {shap_explanation.get('output_value', 'N/A')}\n"
+        f"top_contributions:\n{contribution_block}\n"
+    )
+    path = os.path.join("outputs", f"pr_{pr_number}.txt")
+    with open(path, "w") as fp:
+        fp.write(content)
+    return path
+
+
+def _run_risk_analysis(analyzer: Optional["GeminiRiskAnalyzer"], ml_analyzer: Optional["MLModelRiskAnalyzer"],
+                       details: PRDetails, fv: FeatureVector, repository: str):
+    """Runs LLM and ML analyses, saves their outputs, and prints the summaries. Never raises."""
+    if analyzer is not None:
+        try:
+            risk = analyzer.analyze(details, fv)
+        except Exception:
+            print("LLM analysis failed")
+        else:
+            output_path = save_output(details.number, repository, fv, risk)
+            print("-" * 50)
+            print("Deployment Risk")
+            print()
+            print(f"Risk Score : {risk.get('risk_score', 'N/A')}")
+            print(f"Risk Level : {str(risk.get('risk_level', 'N/A')).upper()}")
+            print()
+            print("Summary :")
+            print(risk.get("summary", ""))
+            print()
+            print("Saved to")
+            print(output_path)
+            print("-" * 50)
+
+    if ml_analyzer is not None:
+        try:
+            ml_result = ml_analyzer.predict(fv)
+        except Exception as exc:
+            print(f"ML model analysis failed: {exc}")
+        else:
+            output_path = save_ml_output(details.number, repository, fv, ml_result)
+            print("-" * 50)
+            print("ML Model Prediction")
+            print()
+            print(f"Bug Probability : {ml_result.get('bug_probability', 'N/A')}")
+            print(f"Risk Level : {ml_result.get('risk_level', 'N/A')}")
+            print()
+            print("Saved to")
+            print(output_path)
+            print("-" * 50)
 
 
 def print_line_changes(details: PRDetails):
@@ -633,7 +766,8 @@ def print_feature_vector(fv: FeatureVector, pr_number: int):
 
 def poll_for_new_prs(client: GitHubPRClient, interval: int, show_patch: bool, post_comment: bool,
                      show_lines: bool = False, feature_extractor: Optional[GitFeatureExtractor] = None,
-                     analyzer: Optional["GeminiRiskAnalyzer"] = None):
+                     analyzer: Optional["GeminiRiskAnalyzer"] = None,
+                     ml_analyzer: Optional["MLModelRiskAnalyzer"] = None):
     """
     Repeatedly checks for open PRs. Tracks the 'updated_at' timestamp of the
     most recently seen PR per number so it only reports genuinely new activity
@@ -662,8 +796,7 @@ def poll_for_new_prs(client: GitHubPRClient, interval: int, show_patch: bool, po
                             print(f"  -> Warning: fetch before feature extraction failed: {e}", file=sys.stderr)
                         fv = feature_extractor.extract(details)
                         print_feature_vector(fv, number)
-                        if analyzer is not None:
-                            _run_risk_analysis(analyzer, details, fv, f"{client.owner}/{client.repo}")
+                        _run_risk_analysis(analyzer, ml_analyzer, details, fv, f"{client.owner}/{client.repo}")
                     if post_comment:
                         try:
                             client.post_pr_comment(number, "Reviewed by DeployIQ")
@@ -704,6 +837,7 @@ def main():
 
     feature_extractor = None
     analyzer = None
+    ml_analyzer = None
     if args.features:
         repo_manager = LocalRepoManager(args.owner, args.repo, local_path=args.repo_path, token=args.token)
         local_repo = repo_manager.get_repo()
@@ -712,10 +846,15 @@ def main():
             analyzer = GeminiRiskAnalyzer()
         except RuntimeError as e:
             print(f"Warning: Gemini risk analysis disabled ({e})", file=sys.stderr)
+        try:
+            ml_analyzer = MLModelRiskAnalyzer()
+        except RuntimeError as e:
+            print(f"Warning: ML model analysis disabled ({e})", file=sys.stderr)
 
     if args.poll:
         poll_for_new_prs(client, interval=args.interval, show_patch=args.patch, post_comment=args.comment,
-                         show_lines=args.lines, feature_extractor=feature_extractor, analyzer=analyzer)
+                         show_lines=args.lines, feature_extractor=feature_extractor, analyzer=analyzer,
+                         ml_analyzer=ml_analyzer)
     elif args.pr:
         details = client.get_pr_details(args.pr)
         if args.json:
@@ -730,8 +869,7 @@ def main():
                 print(json.dumps(fv.to_dict(), indent=2))
             else:
                 print_feature_vector(fv, args.pr)
-            if analyzer is not None:
-                _run_risk_analysis(analyzer, details, fv, f"{args.owner}/{args.repo}")
+            _run_risk_analysis(analyzer, ml_analyzer, details, fv, f"{args.owner}/{args.repo}")
         if args.comment:
             client.post_pr_comment(args.pr, "Reviewed by DeployIQ")
             print(f"Posted comment on PR #{args.pr}")
@@ -749,8 +887,7 @@ def main():
             if feature_extractor is not None:
                 fv = feature_extractor.extract(details)
                 print_feature_vector(fv, summary["number"])
-                if analyzer is not None:
-                    _run_risk_analysis(analyzer, details, fv, f"{args.owner}/{args.repo}")
+                _run_risk_analysis(analyzer, ml_analyzer, details, fv, f"{args.owner}/{args.repo}")
             if args.comment:
                 client.post_pr_comment(summary["number"], "Reviewed by DeployIQ")
                 print(f"Posted comment on PR #{summary['number']}")
