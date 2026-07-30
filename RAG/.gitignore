@@ -3,3 +3,4 @@ chroma_kb/
 __pycache__/
 *.pyc
 .pytest_cache/
+.env
