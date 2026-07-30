@@ -1,0 +1,43 @@
+{
+  "ml_result": {
+    "feature_vector": {
+      "ns": 2,
+      "nd": 3,
+      "nf": 4,
+      "ent": 2.41,
+      "la": 320,
+      "ld": 45,
+      "ndev": 5,
+      "age": 120.0,
+      "nuc": 8.0,
+      "aexp": 9,
+      "arexp": 4,
+      "asexp": 3
+    },
+    "shap_explanation": {
+      "base_value": -1.12,
+      "output_value": 0.84,
+      "contributions": [
+        { "feature_name": "nf", "raw_value": 4, "shap_value": 0.74, "direction": "increases_risk", "rank": 1 },
+        { "feature_name": "la", "raw_value": 320, "shap_value": 0.51, "direction": "increases_risk", "rank": 2 },
+        { "feature_name": "ent", "raw_value": 2.41, "shap_value": 0.43, "direction": "increases_risk", "rank": 3 },
+        { "feature_name": "aexp", "raw_value": 9, "shap_value": -0.29, "direction": "decreases_risk", "rank": 4 }
+      ]
+    }
+  },
+  "code_review_finding": {
+    "risk_score": 8,
+    "risk_level": "High",
+    "summary": "This PR changes the authentication path and introduces raw SQL string concatenation in both the session lookup and the login query, exposing SQL injection. It also removes the 'email' field and renames 'name' to 'full_name' in get_user, a breaking API change.",
+    "top_risk_factors": [
+      "Possible SQL injection in the session lookup and login query",
+      "Authentication logic changed, including a legacy fallback path",
+      "Breaking API change in user_controller.get_user"
+    ],
+    "recommendations": [
+      "Parameterize both raw SQL queries",
+      "Add integration tests for the auth flow before merging",
+      "Deploy behind a feature flag with a canary on login success rate"
+    ]
+  }
+}

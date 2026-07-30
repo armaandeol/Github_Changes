@@ -57,6 +57,7 @@ except ImportError:  # pragma: no cover - exercised only when optional deps are 
     xgb = None
 
 load_dotenv()  # reads .env in the current working directory and populates os.environ
+load_dotenv(os.path.join(os.path.dirname(__file__), "RAG", ".env"))
 
 GITHUB_API = "https://api.github.com"
 
@@ -613,93 +614,67 @@ class GeminiRiskAnalyzer:
             return {"raw_response": raw_text}
 
 
-def save_output(pr_number: int, repository: str, fv: FeatureVector, llm_response: dict) -> str:
-    """Saves the FeatureVector + Gemini risk assessment to outputs/pr_<PR_NUMBER>.json."""
-    os.makedirs("outputs", exist_ok=True)
-    payload = {
-        "pr_number": pr_number,
-        "repository": repository,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "feature_vector": fv.to_dict(),
-        "llm_response": llm_response,
-    }
-    path = os.path.join("outputs", f"pr_{pr_number}.json")
-    with open(path, "w") as fp:
-        json.dump(payload, fp, indent=2)
-    return path
-
-
-def save_ml_output(pr_number: int, repository: str, fv: FeatureVector, ml_result: dict) -> str:
-    """Saves the ML model prediction to outputs/pr_<PR_NUMBER>.txt."""
-    os.makedirs("outputs", exist_ok=True)
-    shap_explanation = ml_result.get("shap_explanation", {}) or {}
-    contributions = shap_explanation.get("top_contributions", []) or []
-    contribution_block = "\n".join(
-        f"- {item['feature_name']}: value={item['feature_value']}, shap_value={item['shap_value']}, direction={item['direction']}"
-        for item in contributions
-    )
-    if not contribution_block:
-        contribution_block = "(no SHAP contributions available)"
-
-    content = (
-        f"PR #{pr_number}\n"
-        f"Repository: {repository}\n"
-        f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n\n"
-        f"Feature Vector:\n{json.dumps(fv.to_dict(), indent=2)}\n\n"
-        f"ML Prediction:\n"
-        f"raw_probability: {ml_result.get('raw_probability', 'N/A')}\n"
-        f"bug_probability: {ml_result.get('bug_probability', 'N/A')}\n"
-        f"risk_level: {ml_result.get('risk_level', 'N/A')}\n\n"
-        f"SHAP Explanation:\n"
-        f"base_value: {shap_explanation.get('base_value', 'N/A')}\n"
-        f"output_value: {shap_explanation.get('output_value', 'N/A')}\n"
-        f"top_contributions:\n{contribution_block}\n"
-    )
-    path = os.path.join("outputs", f"pr_{pr_number}.txt")
-    with open(path, "w") as fp:
-        fp.write(content)
-    return path
-
-
 def _run_risk_analysis(analyzer: Optional["GeminiRiskAnalyzer"], ml_analyzer: Optional["MLModelRiskAnalyzer"],
                        details: PRDetails, fv: FeatureVector, repository: str):
-    """Runs LLM and ML analyses, saves their outputs, and prints the summaries. Never raises."""
+    """Runs LLM and ML analyses, and feeds them directly to the RAG agent."""
+    risk = None
     if analyzer is not None:
         try:
             risk = analyzer.analyze(details, fv)
-        except Exception:
-            print("LLM analysis failed")
-        else:
-            output_path = save_output(details.number, repository, fv, risk)
-            print("-" * 50)
-            print("Deployment Risk")
-            print()
-            print(f"Risk Score : {risk.get('risk_score', 'N/A')}")
-            print(f"Risk Level : {str(risk.get('risk_level', 'N/A')).upper()}")
-            print()
-            print("Summary :")
-            print(risk.get("summary", ""))
-            print()
-            print("Saved to")
-            print(output_path)
-            print("-" * 50)
+        except Exception as exc:
+            print(f"LLM analysis failed: {exc}")
 
+    ml_result = None
     if ml_analyzer is not None:
         try:
             ml_result = ml_analyzer.predict(fv)
         except Exception as exc:
             print(f"ML model analysis failed: {exc}")
-        else:
-            output_path = save_ml_output(details.number, repository, fv, ml_result)
+
+    if risk and ml_result:
+        # Prepare AgentInput
+        import sys
+        rag_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "RAG")
+        if rag_dir not in sys.path:
+            sys.path.insert(0, rag_dir)
+        
+        try:
+            from schemas import AgentInput
+            from agent import run_agent
+            
+            contributions = ml_result["shap_explanation"]["top_contributions"]
+            formatted_contributions = []
+            for i, c in enumerate(contributions):
+                formatted_contributions.append({
+                    "feature_name": c["feature_name"],
+                    "raw_value": c["feature_value"],
+                    "shap_value": c["shap_value"],
+                    "direction": c["direction"],
+                    "rank": i + 1
+                })
+                
+            agent_payload = {
+                "ml_result": {
+                    "feature_vector": ml_result["feature_vector"],
+                    "shap_explanation": {
+                        "base_value": ml_result["shap_explanation"]["base_value"],
+                        "output_value": ml_result["shap_explanation"]["output_value"],
+                        "contributions": formatted_contributions
+                    }
+                },
+                "code_review_finding": risk
+            }
+            
+            agent_input = AgentInput.model_validate(agent_payload)
             print("-" * 50)
-            print("ML Model Prediction")
-            print()
-            print(f"Bug Probability : {ml_result.get('bug_probability', 'N/A')}")
-            print(f"Risk Level : {ml_result.get('risk_level', 'N/A')}")
-            print()
-            print("Saved to")
-            print(output_path)
+            print(f"Running Agentic RAG Pipeline for PR #{details.number}...")
+            result = run_agent(agent_input, verbose=True)
             print("-" * 50)
+            print("Final Deployment Report from RAG:")
+            print(json.dumps(result.report.model_dump(), indent=2))
+            print("-" * 50)
+        except Exception as e:
+            print(f"Failed to run RAG pipeline: {e}")
 
 
 def print_line_changes(details: PRDetails):

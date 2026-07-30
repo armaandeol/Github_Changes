@@ -1,0 +1,40 @@
+{
+  "ml_result": {
+    "feature_vector": {
+      "ns": 1,
+      "nd": 1,
+      "nf": 1,
+      "ent": 0.0,
+      "la": 6,
+      "ld": 1,
+      "ndev": 2,
+      "age": 5661.0,
+      "nuc": 2.0,
+      "aexp": 0,
+      "arexp": 0,
+      "asexp": 0
+    },
+    "shap_explanation": {
+      "base_value": -1.12,
+      "output_value": 0.07,
+      "contributions": [
+        { "feature_name": "nf", "raw_value": 1, "shap_value": -0.14, "direction": "decreases_risk", "rank": 1 },
+        { "feature_name": "la", "raw_value": 6, "shap_value": -0.08, "direction": "decreases_risk", "rank": 2 },
+        { "feature_name": "ent", "raw_value": 0.0, "shap_value": -0.05, "direction": "decreases_risk", "rank": 3 },
+        { "feature_name": "aexp", "raw_value": 0, "shap_value": 0.04, "direction": "increases_risk", "rank": 4 }
+      ]
+    }
+  },
+  "code_review_finding": {
+    "risk_score": 2,
+    "risk_level": "Low",
+    "summary": "This PR consists purely of minor documentation updates to the getting-started and CONTRIBUTING files. Although the author has no prior commit experience in this repository, documentation changes carry negligible deployment risk to software functionality.",
+    "top_risk_factors": [
+      "First-time contributor with zero recorded author experience (aexp = 0)"
+    ],
+    "recommendations": [
+      "Verify formatting and accuracy of the added instructions",
+      "Merge directly as no production code or test files are affected"
+    ]
+  }
+}
